@@ -375,7 +375,7 @@ pub(crate) fn build_side_one_desired_task_count_handler(
     let has_min_temp = schema.fields().iter().any(|f| f.name() == "MinTemp");
     let has_max_temp = schema.fields().iter().any(|f| f.name() == "MaxTemp");
     if has_min_temp && !has_max_temp {
-        Some(Ok(DesiredTaskCountEventResponse::soft(0.0).hard(1)))
+        Some(Ok(DesiredTaskCountEventResponse::exact(0.0, 1)))
     } else {
         None
     }
