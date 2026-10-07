@@ -78,10 +78,12 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
             .map(|msg| decode_worker_to_coordinator_msg(msg?))
             .boxed();
 
-        MetricBuilder::new(&metrics)
-            .with_label(Label::new(DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, "0"))
-            .bytes_counter("plan_bytes_sent")
-            .add_bytes(plan_bytes_sent);
+        BytesMetricExt::bytes_counter(
+            MetricBuilder::new(&metrics)
+                .with_label(Label::new(DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, "0")),
+            "plan_bytes_sent",
+        )
+        .add_bytes(plan_bytes_sent);
 
         Ok(output_stream)
     }
@@ -106,7 +108,8 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
         let mut curr_max_mem = 0;
         let max_mem_used = MetricBuilder::new(&metrics).global_gauge("max_mem_used");
         // Track the total encoded size of all recieved messages.
-        let bytes_transferred = MetricBuilder::new(&metrics).bytes_counter("bytes_transferred");
+        let bytes_transferred =
+            BytesMetricExt::bytes_counter(MetricBuilder::new(&metrics), "bytes_transferred");
         let msg_count = MetricBuilder::new(&metrics).global_counter("msg_count");
         // Track end-to-end network latency distribution for messages that actually arrive.
         let mut latency_metrics = NetworkLatencyMetrics::new(&metrics);

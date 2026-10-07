@@ -14,21 +14,21 @@ datafusion-distributed = { path = "..", features = [
 ] }
 tokio = { version = "1.48", features = ["full"] }
 url = "2.5.7"
-parquet = { version = "59" }
+parquet = { version = "60" }
 structopt = { version = "0.3.26" }
 log = "0.4.27"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.141"
 env_logger = "0.11.8"
 futures = "0.3.31"
-arrow = { version = "59", features = ["test_utils"] }
+arrow = { version = "60", features = ["test_utils"] }
 tonic = { version = "0.14.1", features = ["transport"] }
-tpchgen = { git = "https://github.com/clflushopt/tpchgen-rs", rev = "f42708c32e7fd816b8ad8d2a880c1802a71b669f" }
-tpchgen-arrow = { git = "https://github.com/clflushopt/tpchgen-rs", rev = "f42708c32e7fd816b8ad8d2a880c1802a71b669f" }
+tpchgen = { git = "https://github.com/clflushopt/tpchgen-rs", rev = "1326576e5070b705f9d0f9e364435b9697b9cef9" }
+tpchgen-arrow = { git = "https://github.com/clflushopt/tpchgen-rs", rev = "1326576e5070b705f9d0f9e364435b9697b9cef9" }
 reqwest = "0.12"
 zip = "6.0"
 sketches-ddsketch = "0.3"
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 openssl = { version = "0.10", features = ["vendored"] }
 mimalloc = "0.1"
 
