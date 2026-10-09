@@ -26,7 +26,7 @@ channel, so they are not lost even if the result stream is dropped early (for ex
 
 ## Rendering a plan with metrics
 
-Two functions, both exported from the crate root, do the work:
+Three functions, all exported from the crate root, do the work:
 
 - `rewrite_distributed_plan_with_metrics(plan, format)` — folds every task's metrics back into the
   coordinator's copy of the plan. It waits for all worker metrics to arrive, so the result is always
@@ -36,6 +36,9 @@ Two functions, both exported from the crate root, do the work:
       (`output_rows={0:.., 1:..}`) so you can see each task individually.
 - `display_plan_ascii(plan, show_metrics)` — renders the plan tree. Pass `true` to include the metrics
   attached to each node.
+- `aggregate_plan_metrics(&plan)` — merges the metrics of every node into one `MetricsSet` aggregated
+  by name, for example the total `bytes_scanned` of a query. Each node is visited once, so passing the
+  plan returned by `rewrite_distributed_plan_with_metrics` counts every stage exactly once.
 
 The order of operations matters: **the plan must be fully executed before its metrics are available.**
 

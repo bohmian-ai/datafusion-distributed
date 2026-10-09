@@ -95,6 +95,27 @@ pub async fn rewrite_distributed_plan_with_metrics(
     )
 }
 
+/// Returns the metrics of every node in `plan` merged and aggregated by name.
+///
+/// Every node is visited exactly once through [ExecutionPlan::children]. A network boundary
+/// exposes its input stage as its child, so passing the plan returned by
+/// [rewrite_distributed_plan_with_metrics] aggregates the metrics of every executed stage, while
+/// any non-distributed plan simply aggregates its own nodes.
+pub fn aggregate_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> MetricsSet {
+    fn collect(plan: &Arc<dyn ExecutionPlan>, all: &mut MetricsSet) {
+        for metric in plan.metrics().iter().flat_map(MetricsSet::iter) {
+            all.push(Arc::clone(metric));
+        }
+        for child in plan.children() {
+            collect(child, all);
+        }
+    }
+
+    let mut all = MetricsSet::new();
+    collect(plan, &mut all);
+    all.aggregate_by_name()
+}
+
 /// Extra information for rewriting local plans.
 #[derive(Default)]
 pub struct RewriteCtx {
@@ -292,7 +313,9 @@ mod tests {
     use crate::metrics::task_metrics_rewriter::{
         annotate_metrics_set_with_task_id, stage_metrics_rewriter,
     };
-    use crate::metrics::{DistributedMetricsFormat, rewrite_distributed_plan_with_metrics};
+    use crate::metrics::{
+        DistributedMetricsFormat, aggregate_plan_metrics, rewrite_distributed_plan_with_metrics,
+    };
     use crate::stage::LocalStage;
     use crate::test_utils::in_memory_channel_resolver::{
         InMemoryChannelResolver, InMemoryWorkerResolver,
@@ -300,10 +323,13 @@ mod tests {
     use crate::test_utils::metrics::make_test_metrics_set_from_seed;
     use crate::test_utils::plans::count_plan_nodes_up_to_network_boundary;
     use crate::test_utils::session_context::register_temp_parquet_table;
-    use crate::{DistributedExec, SessionStateBuilderExt, TaskKey, TaskMetrics};
+    use crate::{
+        DistributedExec, SessionStateBuilderExt, TaskKey, TaskMetrics, display_plan_ascii,
+    };
     use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::metrics::{Count, Label, Metric, MetricValue, MetricsSet};
@@ -606,6 +632,85 @@ mod tests {
                 .await
                 .unwrap();
         assert_metrics_present_in_plan(&rewritten_plan);
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_plan_metrics_counts_each_stage_once() {
+        let ctx = make_test_distributed_ctx().await;
+        let plan = execute_plan(ctx, "SELECT id, name FROM table1 WHERE id > 1").await;
+        let rewritten_plan = rewrite_distributed_plan_with_metrics(
+            Arc::clone(&plan),
+            DistributedMetricsFormat::Aggregated,
+        )
+        .await
+        .unwrap();
+        assert!(display_plan_ascii(rewritten_plan.as_ref(), false).contains("[Stage 1]"));
+
+        // Every scan runs in a worker task, so the raw per-task metrics are the ground truth.
+        let store = plan
+            .downcast_ref::<DistributedExec>()
+            .unwrap()
+            .metrics_store
+            .clone();
+        let mut reported = MetricsSet::new();
+        for task in store.unwrap().rx.borrow().values() {
+            for metric in task
+                .pre_order_plan_metrics
+                .iter()
+                .flat_map(MetricsSet::iter)
+            {
+                reported.push(Arc::clone(metric));
+            }
+        }
+        assert!(bytes_scanned(&reported) > 0);
+        assert_eq!(
+            bytes_scanned(&aggregate_plan_metrics(&rewritten_plan)),
+            bytes_scanned(&reported),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_plan_metrics_single_stage_plan() {
+        let plan = execute_plan(make_test_ctx().await, "SELECT id FROM table1").await;
+
+        let mut expected = MetricsSet::new();
+        plan.apply(|node| {
+            for metric in node.metrics().iter().flat_map(MetricsSet::iter) {
+                expected.push(Arc::clone(metric));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+
+        let aggregated = aggregate_plan_metrics(&plan);
+        assert!(bytes_scanned(&aggregated) > 0);
+        assert_eq!(
+            aggregated.output_rows(),
+            expected.aggregate_by_name().output_rows()
+        );
+        assert_eq!(
+            bytes_scanned(&aggregated),
+            bytes_scanned(&expected.aggregate_by_name())
+        );
+    }
+
+    async fn execute_plan(ctx: SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
+        plan
+    }
+
+    fn bytes_scanned(metrics: &MetricsSet) -> usize {
+        metrics
+            .sum_by_name("bytes_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or_default()
     }
 
     #[test]
