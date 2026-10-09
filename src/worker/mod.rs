@@ -2,6 +2,7 @@ mod impl_coordinator_channel;
 mod impl_execute_task;
 mod session_builder;
 mod single_write_multi_read;
+mod stream_close_state;
 mod task_data;
 #[cfg(any(test, feature = "integration"))]
 pub(crate) mod test_utils;
@@ -9,6 +10,7 @@ mod worker_connection_pool;
 mod worker_service;
 
 pub(crate) use single_write_multi_read::SingleWriteMultiRead;
+pub(crate) use stream_close_state::{CloseOnDrop, StreamCloseState};
 pub(crate) use worker_connection_pool::WorkerConnectionPool;
 
 pub use session_builder::{

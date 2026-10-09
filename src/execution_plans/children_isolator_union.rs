@@ -333,7 +333,10 @@ impl ExecutionPlan for ChildrenIsolatorUnionExec {
                 // We need to intercept the DistributedTaskContext and insert a modified one that
                 // tells the child that is running in "isolation" (see the beginning of this file
                 // for a longer explanation)
-                let context = Arc::new(task_ctx_with_extension(context.as_ref(), child_task_ctx));
+                let context = Arc::new(task_ctx_with_extension(
+                    context.as_ref(),
+                    Arc::new(child_task_ctx),
+                ));
 
                 let stream = input.execute(partition, context)?;
 

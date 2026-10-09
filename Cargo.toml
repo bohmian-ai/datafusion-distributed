@@ -40,7 +40,7 @@ object_store = "0.14"
 bytes = "1.11"
 pin-project = "1.1.10"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 moka = { version = "0.12", features = ["sync", "future"] }
 crossbeam-queue = "0.3"
 sysinfo = { version = "0.30", optional = true }

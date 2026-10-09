@@ -3,6 +3,7 @@ use crate::events::{WorkerPlanRewriteEvent, WorkerPlanRewriteHandlers};
 use crate::execution_plans::SamplerExec;
 use crate::protocol::LocalWorkerContext;
 use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_time};
+use crate::worker::StreamCloseState;
 use crate::worker::task_data::TaskDataMetrics;
 use crate::{
     CoordinatorToWorkerMsg, DistributedConfig, DistributedExt, DistributedTaskContext,
@@ -41,6 +42,7 @@ impl Worker {
 
         let (metrics_tx, metrics_rx) = oneshot::channel();
         let mut load_info_rxs = vec![];
+        let close_state = Arc::new(StreamCloseState::default());
 
         let task_data = || async {
             let mut cfg = SessionConfig::default()
@@ -53,6 +55,7 @@ impl Worker {
                     local_worker: self.clone(),
                     self_url: request.target_worker_url,
                 }))
+                .with_extension(Arc::clone(&close_state))
                 .with_distributed_option_extension_from_headers::<DistributedConfig>(&headers)?;
 
             let d_cfg = DistributedConfig::from_config_options(cfg.options())?;
@@ -94,6 +97,7 @@ impl Worker {
                     false => Arc::new(std::sync::Mutex::new(None)),
                 },
                 task_data_metrics: Arc::new(TaskDataMetrics::new(request.query_start_time_ns)),
+                close_state: Arc::clone(&close_state),
             })
         };
 
@@ -155,6 +159,8 @@ impl Worker {
                     }
                 }
             }
+            // The coordinator ended the query, so nothing will read from this task anymore.
+            task_data.close_state.close();
 
             let metrics_tx = task_data.metrics_tx.lock().unwrap().take();
             if let Some(Ok(plan)) = task_data.final_plan.get() {

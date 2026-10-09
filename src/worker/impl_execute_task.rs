@@ -4,7 +4,6 @@ use datafusion::common::exec_datafusion_err;
 use datafusion::common::{Result, exec_err};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,9 +50,7 @@ impl Worker {
             }
 
             let stream = plan.execute(partition, Arc::clone(&task_ctx))?;
-            let stream_schema = plan.schema();
-
-            streams.push(Box::pin(RecordBatchStreamAdapter::new(stream_schema, stream)) as _);
+            streams.push(task_data.close_state.track_output(stream, partition_count));
         }
         Ok((streams, task_ctx))
     }

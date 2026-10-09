@@ -1,5 +1,6 @@
 use crate::common::OnceLockResult;
 use crate::common::now_ns;
+use crate::worker::StreamCloseState;
 use crate::{MaxLatencyMetric, ProducerHead, TaskMetrics};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
@@ -26,6 +27,9 @@ pub struct TaskData {
     /// associated to a specific node, they are global to the task, like the time at which the plan
     /// was fed by the coordinator to the worker.
     pub(super) task_data_metrics: Arc<TaskDataMetrics>,
+    /// Releases the streams this task reads from other workers once its output streams are done,
+    /// or once the coordinator ends the query. Also present in `task_ctx`.
+    pub(super) close_state: Arc<StreamCloseState>,
 }
 
 pub(crate) const PLAN_ADDED_AT_METRIC: &str = "plan_added_at";

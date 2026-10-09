@@ -1,6 +1,7 @@
 use crate::distributed_planner::ProducerHead;
 use crate::passthrough_headers::get_passthrough_headers;
 use crate::stage::RemoteStage;
+use crate::worker::stream_close_state::{StreamCloseState, StreamSlot};
 use crate::{ExecuteTaskRequest, LocalWorkerContext, TaskKey, get_distributed_channel_resolver};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::runtime::SpawnedTask;
@@ -28,8 +29,9 @@ pub(crate) struct WorkerConnectionPool {
 }
 
 /// A list of consumable RecordBatch streams, each one wrapped by `Mutex<Option<_>>` for
-/// exactly-once consumption semantics.
-type StreamGroup = Arc<Vec<Mutex<Option<BoxStream<'static, Result<RecordBatch>>>>>>;
+/// exactly-once consumption semantics. The [StreamSlot] lets the query's [StreamCloseState] drop
+/// the stream whether or not it was consumed.
+type StreamGroup = Arc<Vec<Mutex<Option<Arc<StreamSlot>>>>>;
 /// Just some boilerplate for a shared future.
 type SharedBoxFuture<T> = Shared<BoxFuture<'static, Result<T, Arc<DataFusionError>>>>;
 
@@ -75,9 +77,18 @@ impl WorkerConnectionPool {
             );
         };
 
+        // Streams are registered with the query's close state, which drops them all when the query
+        // ends. Pools executed outside of a distributed query own their streams alone.
+        let close_state = StreamCloseState::from_ctx(ctx).unwrap_or_default();
+        if close_state.is_closed() {
+            return Ok(futures::stream::empty().boxed());
+        }
+
         let streams_shared_future = worker_connection.get_or_init(|| {
             let metrics = self.metrics.clone();
             let ctx = Arc::clone(ctx);
+            // Keeps `wait_closed` pending until the connection resolved and registered its streams.
+            let in_flight = close_state.track();
 
             // The relevant entry from `task_data_entries` needs to be eagerly retrieved, it cannot be
             // left for until someone decides to start polling the returned `BoxStream`, otherwise,
@@ -86,6 +97,7 @@ impl WorkerConnectionPool {
             //
             // Note that this does not start polling the returned streams, it just instantiates them.
             let streams_task = SpawnedTask::spawn(async move {
+                let _in_flight = in_flight;
                 let request = ExecuteTaskRequest {
                     task_key,
                     target_partition_start: target_partitions.start,
@@ -104,7 +116,13 @@ impl WorkerConnectionPool {
                 }?;
                 let headers = get_passthrough_headers(ctx.session_config());
                 let streams = client.execute_task(headers, request, metrics, &ctx).await?;
-                Ok(streams)
+                let slots: Vec<_> = streams
+                    .into_iter()
+                    .map(|v| Arc::new(Mutex::new(Some(v))))
+                    .collect();
+                // A connection resolving after the query closed drops its streams right away.
+                close_state.register(&slots);
+                Ok(slots)
             });
 
             async move {
@@ -130,11 +148,12 @@ impl WorkerConnectionPool {
                     "WorkerConnections has no stream for partition {target_partition}. Was it already consumed?"
                 );
             };
-            slot.lock().unwrap().take().ok_or_else(|| {
+            let slot = slot.lock().unwrap().take().ok_or_else(|| {
                 internal_datafusion_err!(
                     "WorkerConnections stream for partition {target_partition} was already consumed"
                 )
-            })
+            })?;
+            Ok(StreamCloseState::slot_stream(slot))
         }
         .try_flatten_stream()
         .inspect_ok(move |batch| {

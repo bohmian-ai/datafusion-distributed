@@ -214,6 +214,7 @@ pub async fn register_plan_on_worker(
             final_plan: Default::default(),
             metrics_tx: Arc::new(std::sync::Mutex::new(Some(metrics_tx))),
             task_data_metrics: Arc::new(TaskDataMetrics::new(0)),
+            close_state: Default::default(),
         }))
         .expect("failed to write to task data");
 }

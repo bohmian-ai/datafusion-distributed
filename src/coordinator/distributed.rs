@@ -1,9 +1,11 @@
 use crate::common::require_one_child;
+use crate::common::task_ctx_with_extension;
 use crate::coordinator::metrics_store::MetricsStore;
 use crate::coordinator::prepare_dynamic_plan::prepare_dynamic_plan;
 use crate::coordinator::prepare_static_plan::prepare_static_plan;
 use crate::coordinator::query_coordinator::QueryCoordinator;
 use crate::distributed_planner::NetworkBoundaryExt;
+use crate::worker::{CloseOnDrop, StreamCloseState};
 use crate::{DistributedConfig, TaskKey};
 use datafusion::common::internal_datafusion_err;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -40,6 +42,8 @@ pub struct DistributedExec {
     plan_for_viz: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
     /// The head stage meant to be executed locally on [DistributedExec::execute].
     head_stage: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
+    /// Releases the worker partition streams opened by the last [DistributedExec::execute].
+    close_state: Arc<Mutex<Option<Arc<StreamCloseState>>>>,
     /// DataFusion metrics.
     metrics: ExecutionPlanMetricsSet,
     /// Storage where metrics collected from workers at runtime will place their results as they
@@ -60,6 +64,7 @@ impl DistributedExec {
             base_plan,
             plan_for_viz: Arc::new(Mutex::new(None)),
             head_stage: Arc::new(Mutex::new(None)),
+            close_state: Arc::new(Mutex::new(None)),
             metrics: ExecutionPlanMetricsSet::new(),
             metrics_store: None,
         }
@@ -109,6 +114,19 @@ impl DistributedExec {
         let _ = rx
             .wait_for(|map| expected_keys.iter().all(|key| map.contains_key(key)))
             .await;
+    }
+
+    /// Waits until every worker partition stream opened by the last call to `execute()` has been
+    /// dropped, along with the reader tasks and buffered batches behind it, so the memory they held
+    /// is back in the memory pool.
+    ///
+    /// Streams are released when the query ends: the result stream reaches its end or fails, or it
+    /// is dropped. Returns immediately if `execute()` was never called.
+    pub async fn wait_closed(&self) {
+        let close_state = self.close_state.lock().expect("poisoned lock").clone();
+        if let Some(close_state) = close_state {
+            close_state.wait_closed().await;
+        }
     }
 
     /// Returns the plan which is lazily prepared on `execute()` and actually gets executed.
@@ -171,6 +189,7 @@ impl ExecutionPlan for DistributedExec {
             base_plan: require_one_child(&children)?,
             plan_for_viz: Arc::new(Mutex::new(None)),
             head_stage: Arc::new(Mutex::new(None)),
+            close_state: Arc::new(Mutex::new(None)),
             metrics: self.metrics.clone(),
             metrics_store: self.metrics_store.clone(),
         }))
@@ -195,6 +214,17 @@ impl ExecutionPlan for DistributedExec {
         let plan_for_viz = Arc::clone(&self.plan_for_viz);
         let head_stage = Arc::clone(&self.head_stage);
 
+        // Every network boundary executed under this context registers its worker streams with
+        // this state, which drops them on any exit, including the output stream being dropped
+        // before the plan is even prepared.
+        let close_state = Arc::new(StreamCloseState::default());
+        let context = Arc::new(task_ctx_with_extension(&context, Arc::clone(&close_state)));
+        self.close_state
+            .lock()
+            .expect("poisoned lock")
+            .replace(Arc::clone(&close_state));
+        let close_on_exit = CloseOnDrop(Arc::clone(&close_state));
+
         let query_coordinator = QueryCoordinator::new(
             Arc::clone(&context),
             &self.metrics,
@@ -205,6 +235,7 @@ impl ExecutionPlan for DistributedExec {
         let tx = builder.tx();
 
         builder.spawn(async move {
+            let _close_on_exit = close_on_exit;
             // Dropping this `guard` is what signals the coordinator->worker channel to be dropped,
             // which triggers a chain reaction that ends up also gracefully closing the
             // worker->coordinator channel. The flow looks like this:
@@ -238,6 +269,8 @@ impl ExecutionPlan for DistributedExec {
                 }
             }
             drop(tx);
+            // Release the worker streams before waiting on the workers to wrap up.
+            close_state.close();
             drop(guard);
             query_coordinator.drain_pending_tasks().await?;
             Ok(())

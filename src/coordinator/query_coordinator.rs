@@ -294,7 +294,10 @@ impl<'a> StageCoordinator<'a> {
             let dist_feed_ctx = DistributedWorkUnitFeedContext {
                 fan_out_tasks: d_ctx.task_count,
             };
-            let t_ctx = Arc::new(task_ctx_with_extension(self.task_ctx, dist_feed_ctx));
+            let t_ctx = Arc::new(task_ctx_with_extension(
+                self.task_ctx,
+                Arc::new(dist_feed_ctx),
+            ));
 
             let mut feeds = Vec::with_capacity(end_partition - start_partition);
             for (partition, feed_idx) in (start_partition..end_partition).enumerate() {

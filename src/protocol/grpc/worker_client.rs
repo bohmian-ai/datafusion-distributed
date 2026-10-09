@@ -5,6 +5,7 @@ use super::metrics_proto::metrics_set_proto_to_df;
 use crate::common::serialize_uuid;
 use crate::grpc::generated::worker::FlightAppMetadata;
 use crate::grpc::on_drop_stream::on_drop_stream;
+use crate::worker::StreamCloseState;
 use crate::{
     BytesMetricExt, CoordinatorToWorkerMsg, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL,
     DistributedConfig, ExecuteTaskRequest, FirstLatencyMetric, GetWorkerInfoRequest,
@@ -22,7 +23,7 @@ use datafusion::common::instant::Instant;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::execution::memory_pool::MemoryConsumer;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr_common::metrics::{Count, Label, MetricBuilder, MetricValue, Time};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::stream::BoxStream;
@@ -40,6 +41,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Status};
 
@@ -100,9 +102,12 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
 
         // We are retaining record batches in memory until they are consumed, so we need to account
         // for them in the memory pool.
-        let memory_reservation =
-            Arc::new(MemoryConsumer::new("WorkerConnection").register(ctx.memory_pool()));
-        let memory_reservation_clone = Arc::clone(&memory_reservation);
+        let buffer = Arc::new(ReaderBuffer {
+            reservation: MemoryConsumer::new("WorkerConnection").register(ctx.memory_pool()),
+            _reader: StreamCloseState::from_ctx(ctx).map(|state| state.track()),
+        });
+        let memory_reservation = Arc::clone(&buffer);
+        let memory_reservation_clone = buffer;
 
         // Track the maximum memory used to buffer recieved messages.
         let mut curr_max_mem = 0;
@@ -194,7 +199,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 // the way back to the worker without coupling sibling partitions.
                 // We always allow a message through when reservation == 0 to avoid
                 // livelock if a single message is larger than the budget.
-                while memory_reservation.size() >= buffer_budget_bytes {
+                while memory_reservation.reservation.size() >= buffer_budget_bytes {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
@@ -255,12 +260,12 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 // memory reservation means releasing the memory from the pool for that specific
                 // message
                 let size = flight_data.encoded_len();
-                memory_reservation.grow(size);
+                memory_reservation.reservation.grow(size);
 
                 // Update memory related metrics.
                 msg_count.add(1);
                 bytes_transferred.add_bytes(size);
-                let curr_mem = memory_reservation.size();
+                let curr_mem = memory_reservation.reservation.size();
                 if curr_mem > curr_max_mem {
                     curr_max_mem = curr_mem;
                     max_mem_used.set(curr_max_mem);
@@ -271,7 +276,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                     // completed early without consuming its probe side). Don't exit: other
                     // partitions multiplexed over the same gRPC stream still need their data.
                     // Undo the memory reservation that was grown for this dropped batch.
-                    memory_reservation.shrink(size);
+                    memory_reservation.reservation.shrink(size);
                     continue;
                 };
             }
@@ -296,7 +301,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
             let reservation = Arc::clone(&memory_reservation_clone);
             let mem_available_notify = Arc::clone(&mem_available_notify);
             let stream = stream.map_ok(move |(data, _meta)| {
-                reservation.shrink(data.encoded_len());
+                reservation.reservation.shrink(data.encoded_len());
                 // Wake the demux task in case it is blocked on the byte budget.
                 mem_available_notify.notify_one();
                 let _ = &task; // <- keep the task that polls data from the network alive.
@@ -338,6 +343,15 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
 }
 
 type WorkerMsg = Result<(FlightData, FlightAppMetadata), Status>;
+
+/// Accounts for the batches an `execute_task` call buffers until they are consumed. Shared by the
+/// reader task and the partition streams, so it is dropped once all of them are gone. The
+/// `_reader` token is declared last so the query's close state only sees the reader as finished
+/// once the buffered bytes are back in the memory pool.
+struct ReaderBuffer {
+    reservation: MemoryReservation,
+    _reader: Option<TaskTrackerToken>,
+}
 
 struct NetworkLatencyMetrics {
     metrics: ExecutionPlanMetricsSet,
