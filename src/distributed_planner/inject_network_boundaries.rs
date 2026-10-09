@@ -317,7 +317,8 @@ async fn _inject_network_boundaries(
         processed_children,
         ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
     )?;
-    // Cap the reconciled task count by the configured max-per-stage budget.
+    // Bound the reconciled task count to at least one task and at most the configured
+    // max-per-stage budget.
     let task_count = task_count.limit(nb_ctx.max_tasks()?);
 
     // Upon reaching a hash repartition, we need to introduce a network shuffle right above it.
@@ -665,6 +666,8 @@ mod tests {
     use crate::distributed_planner::normalize_collect_joins::normalize_collect_joins;
     use crate::test_utils::plans::{TestPlanBuilder, build_side_one_desired_task_count_handler};
     use crate::{DesiredTaskCountEvent, DesiredTaskCountEventResponse, assert_snapshot};
+    use datafusion::datasource::physical_plan::FileScanConfig;
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     /* schema for the "weather" table
 
@@ -705,6 +708,30 @@ mod tests {
             .broadcast_joins(false);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
         assert_snapshot!(annotated, @"DistributedLeafExec: task_count=Desired(4)")
+    }
+
+    #[tokio::test]
+    async fn test_file_scan_without_bytes_runs_in_one_task() {
+        let test_plan = TestPlanBuilder::new()
+            .target_partitions(4)
+            .num_workers(4)
+            .distributed_planner(false)
+            .build()
+            .await;
+        let plan = test_plan.physical_plan("SELECT * FROM weather").await;
+        let dse = plan
+            .downcast_ref::<DataSourceExec>()
+            .expect("a bare scan plans as a DataSourceExec");
+        let mut empty = dse
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .expect("a parquet scan is a FileScanConfig")
+            .clone();
+        empty.file_groups.clear();
+        let plan = DataSourceExec::from_data_source(empty) as Arc<dyn ExecutionPlan>;
+
+        let annotated = annotate_physical_plan(plan, test_plan.get_ctx().copied_config()).await;
+        assert_snapshot!(annotated, @"DistributedLeafExec: task_count=Desired(1)")
     }
 
     #[tokio::test]
@@ -1346,8 +1373,13 @@ mod tests {
     async fn annotate_test_plan(test_plan_builder: TestPlanBuilder, query: &str) -> String {
         let test_plan = test_plan_builder.build().await;
         let plan = test_plan.physical_plan(query).await;
-        let session_config = test_plan.get_ctx().copied_config();
+        annotate_physical_plan(plan, test_plan.get_ctx().copied_config()).await
+    }
 
+    async fn annotate_physical_plan(
+        plan: Arc<dyn ExecutionPlan>,
+        session_config: SessionConfig,
+    ) -> String {
         let plan = normalize_collect_joins(plan, session_config.options())
             .expect("failed to normalize collect joins");
         let plan = insert_broadcast_execs(plan, session_config.options())

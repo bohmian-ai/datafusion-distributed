@@ -113,10 +113,14 @@ impl TaskCountAnnotation {
         }
     }
 
+    /// Bounds the annotation to between one task and `limit` tasks.
+    ///
+    /// A stage always runs in at least one task, even when nothing asked for any: a file scan
+    /// with no bytes to read, for example, still has to produce its empty output somewhere.
     pub(crate) fn limit(self, limit: usize) -> Self {
         match self {
-            Desired(desired) => Desired(desired.min(limit)),
-            Maximum(maximum) => Maximum(maximum.min(limit)),
+            Desired(desired) => Desired(desired.clamp(1, limit.max(1))),
+            Maximum(maximum) => Maximum(maximum.clamp(1, limit.max(1))),
         }
     }
 
