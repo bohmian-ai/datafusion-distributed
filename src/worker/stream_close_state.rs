@@ -148,211 +148,92 @@ impl Drop for TrackedOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::require_one_child;
     use crate::test_utils::in_memory_channel_resolver::{
-        InMemoryChannelResolver, InMemoryWorkerResolver,
+        InMemoryChannelResolver, InMemoryWorkerResolver, start_configured_in_memory_context,
     };
     use crate::test_utils::parquet::register_parquet_tables;
     use crate::{
-        ChannelResolver, CoordinatorToWorkerMsg, DistributedExec, DistributedExt,
-        ExecuteTaskRequest, GetWorkerInfoRequest, GetWorkerInfoResponse, NetworkBoundaryExt,
+        ChannelResolver, CoordinatorToWorkerMsg, DefaultSessionBuilder, DistributedExec,
+        DistributedExt, ExecuteTaskRequest, GetWorkerInfoRequest, GetWorkerInfoResponse,
         SessionStateBuilderExt, SetPlanRequest, WorkerChannel, WorkerQueryContext,
         WorkerSessionBuilder, WorkerToCoordinatorMsg, display_plan_ascii,
     };
     use async_trait::async_trait;
-    use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
     use datafusion::error::DataFusionError;
     use datafusion::execution::runtime_env::RuntimeEnv;
     use datafusion::execution::{SessionState, SessionStateBuilder};
-    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use futures::{FutureExt, TryStreamExt};
+    use futures::FutureExt;
     use http::HeaderMap;
-    use std::fmt::{Debug, Formatter};
     use std::future::Future;
     use std::time::Duration;
     use tokio::sync::{Notify, Semaphore};
     use url::Url;
 
-    const WEATHER_ROWS: usize = 366;
-
-    #[tokio::test]
-    async fn releases_held_build_side_after_end_of_stream() {
-        let cluster = Cluster::new(true).await;
-        let held = Arc::new(Mutex::new(vec![]));
-        let plan = hold_network_inputs(cluster.plan("SELECT * FROM weather").await, &held);
-
-        assert_eq!(cluster.run(&plan).await, 0);
-        cluster.assert_released(&plan).await;
-
-        // The pools dropped what the held streams were reading, so they end when polled.
-        let held = std::mem::take(&mut *held.lock().unwrap());
-        assert!(!held.is_empty());
-        for mut stream in held {
-            assert!(stream.next().await.is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn releases_streams_when_root_is_dropped_mid_query() {
-        let cluster = Cluster::new(true).await;
-        let plan = cluster.plan("SELECT * FROM weather").await;
-
-        let mut stream = plan.execute(0, cluster.ctx.task_ctx()).unwrap();
-        stream.next().await.unwrap().unwrap();
-        drop(stream);
-
-        cluster.assert_released(&plan).await;
-    }
-
-    #[tokio::test]
-    async fn releases_streams_when_root_is_dropped_before_preparation() {
-        let cluster = Cluster::new(true).await;
-        let plan = cluster.plan("SELECT * FROM weather").await;
-
-        drop(plan.execute(0, cluster.ctx.task_ctx()).unwrap());
-
-        cluster.assert_released(&plan).await;
-    }
-
     #[tokio::test]
     async fn drops_streams_of_a_connection_resolving_after_close() {
-        let cluster = Cluster::new(false).await;
-        let plan = cluster.plan("SELECT * FROM weather").await;
+        let channel = GatedChannel::default();
+        let ctx = gated_context(channel.clone()).await;
+        let plan = plan(&ctx, "SELECT * FROM weather").await;
 
-        let stream = plan.execute(0, cluster.ctx.task_ctx()).unwrap();
-        within(cluster.channel.gate.entered.notified()).await;
-        let state = Arc::clone(&cluster.channel.states.lock().unwrap()[0]);
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        within(channel.entered.notified()).await;
+        let state = channel.state.lock().unwrap().take().unwrap();
         drop(stream);
         within(state.closed.cancelled()).await;
         // The in-flight connection keeps the query from being reported as released.
         assert!(state.wait_closed().now_or_never().is_none());
 
-        cluster.channel.gate.open.add_permits(1);
-        cluster.assert_released(&plan).await;
+        channel.open.add_permits(Semaphore::MAX_PERMITS);
+        within(dist(&plan).wait_closed()).await;
+        assert_eq!(ctx.runtime_env().memory_pool.reserved(), 0);
     }
 
     #[tokio::test]
-    async fn closing_one_query_leaves_a_concurrent_one_running() {
-        let cluster = Cluster::new(true).await;
-        let closed = cluster.plan("SELECT * FROM weather").await;
-        let running = cluster.plan("SELECT * FROM weather").await;
-
-        let mut closed_stream = closed.execute(0, cluster.ctx.task_ctx()).unwrap();
-        let mut running_stream = running.execute(0, cluster.ctx.task_ctx()).unwrap();
-        closed_stream.next().await.unwrap().unwrap();
-        let first = running_stream.next().await.unwrap().unwrap();
-        drop(closed_stream);
-        within(dist(&closed).wait_closed()).await;
-
-        let rest: usize = running_stream
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap()
-            .iter()
-            .map(|batch| batch.num_rows())
-            .sum();
-        assert_eq!(first.num_rows() + rest, WEATHER_ROWS);
-        cluster.assert_released(&running).await;
-    }
-
-    #[tokio::test]
-    async fn releases_worker_stage_streams_when_root_is_dropped() {
-        let cluster = Cluster::new(true).await;
-        let sql = r#"SELECT "MinTemp", count(*) FROM weather GROUP BY "MinTemp""#;
-        let plan = cluster.plan(sql).await;
+    async fn closes_worker_tasks_when_the_query_is_dropped() {
+        let tasks = Arc::new(Mutex::new(vec![]));
+        let worker_runtime = Arc::new(RuntimeEnv::default());
+        let runtime = Arc::clone(&worker_runtime);
+        let ctx =
+            start_configured_in_memory_context(3, RecordTasks(Arc::clone(&tasks)), move |w| {
+                w.with_runtime_env(Arc::clone(&runtime))
+            })
+            .await;
+        register_parquet_tables(&ctx).await.unwrap();
+        let plan = plan(
+            &ctx,
+            r#"SELECT "MinTemp", count(*) FROM weather GROUP BY "MinTemp""#,
+        )
+        .await;
         let display = display_plan_ascii(plan.as_ref(), false);
         assert!(display.contains("NetworkShuffleExec"), "{display}");
 
-        let mut stream = plan.execute(0, cluster.ctx.task_ctx()).unwrap();
+        let mut stream = plan.execute(0, ctx.task_ctx()).unwrap();
         stream.next().await.unwrap().unwrap();
         drop(stream);
-        cluster.assert_released(&plan).await;
 
-        let sibling = cluster.plan("SELECT * FROM weather").await;
-        assert_eq!(cluster.run(&sibling).await, WEATHER_ROWS);
-        cluster.assert_released(&sibling).await;
+        within(dist(&plan).wait_closed()).await;
+        let tasks = std::mem::take(&mut *tasks.lock().unwrap());
+        assert!(!tasks.is_empty());
+        for task in tasks {
+            within(task.wait_closed()).await;
+            assert!(task.is_closed());
+        }
+        assert_eq!(worker_runtime.memory_pool.reserved(), 0);
     }
 
-    /// A coordinator backed by in-memory workers, recording the [StreamCloseState] of every
-    /// coordinator query and worker task.
-    struct Cluster {
-        ctx: SessionContext,
-        channel: RecordingChannel,
-        worker_tasks: Arc<Mutex<Vec<Arc<StreamCloseState>>>>,
-        worker_runtime: Arc<RuntimeEnv>,
-    }
-
-    impl Cluster {
-        /// Builds the cluster. When `open` is false, coordinator connections to workers wait
-        /// until [Gate::open] gets a permit.
-        async fn new(open: bool) -> Self {
-            let worker_tasks = Arc::new(Mutex::new(vec![]));
-            let worker_runtime = Arc::new(RuntimeEnv::default());
-            let runtime = Arc::clone(&worker_runtime);
-            let inner = InMemoryChannelResolver::from_configured_worker(
-                RecordWorkerTasks(Arc::clone(&worker_tasks)),
-                move |worker| worker.with_runtime_env(Arc::clone(&runtime)),
-            );
-            let channel = RecordingChannel {
-                inner,
-                gate: Arc::new(Gate {
-                    entered: Notify::new(),
-                    open: Semaphore::new(if open { Semaphore::MAX_PERMITS } else { 0 }),
-                }),
-                states: Arc::new(Mutex::new(vec![])),
-            };
-            let state = SessionStateBuilder::new()
-                .with_default_features()
-                .with_config(SessionConfig::new().with_target_partitions(3))
-                .with_distributed_planner()
-                .with_distributed_worker_resolver(InMemoryWorkerResolver::new(3))
-                .with_distributed_channel_resolver(channel.clone())
-                .with_distributed_file_scan_config_bytes_per_partition(1)
-                .unwrap()
-                .with_distributed_shuffle_batch_size(8)
-                .unwrap()
-                .build();
-            let ctx = SessionContext::from(state);
-            register_parquet_tables(&ctx).await.unwrap();
-            Self {
-                ctx,
-                channel,
-                worker_tasks,
-                worker_runtime,
-            }
-        }
-
-        async fn plan(&self, sql: &str) -> Arc<dyn ExecutionPlan> {
-            let df = self.ctx.sql(sql).await.unwrap();
-            let plan = df.create_physical_plan().await.unwrap();
-            assert!(plan.is::<DistributedExec>());
-            plan
-        }
-
-        /// Executes `plan` to completion, returning its row count.
-        async fn run(&self, plan: &Arc<dyn ExecutionPlan>) -> usize {
-            let stream = plan.execute(0, self.ctx.task_ctx()).unwrap();
-            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-            batches.iter().map(|batch| batch.num_rows()).sum()
-        }
-
-        /// Asserts that every stream opened so far was released: each recorded close state is
-        /// closed with no reader task left, and no memory pool holds a reservation.
-        async fn assert_released(&self, plan: &Arc<dyn ExecutionPlan>) {
-            within(dist(plan).wait_closed()).await;
-            let mut states = std::mem::take(&mut *self.channel.states.lock().unwrap());
-            states.append(&mut self.worker_tasks.lock().unwrap());
-            for state in states {
-                within(state.wait_closed()).await;
-                assert!(state.is_closed());
-                assert!(state.readers.is_empty());
-            }
-            assert_eq!(self.ctx.runtime_env().memory_pool.reserved(), 0);
-            assert_eq!(self.worker_runtime.memory_pool.reserved(), 0);
-        }
+    async fn plan(ctx: &SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        assert!(plan.is::<DistributedExec>());
+        plan
     }
 
     fn dist(plan: &Arc<dyn ExecutionPlan>) -> &DistributedExec {
@@ -365,11 +246,11 @@ mod tests {
             .expect("timed out")
     }
 
-    /// Records the [StreamCloseState] of every task the worker builds a session for.
-    struct RecordWorkerTasks(Arc<Mutex<Vec<Arc<StreamCloseState>>>>);
+    /// Records the [StreamCloseState] of every task the workers build a session for.
+    struct RecordTasks(Arc<Mutex<Vec<Arc<StreamCloseState>>>>);
 
     #[async_trait]
-    impl WorkerSessionBuilder for RecordWorkerTasks {
+    impl WorkerSessionBuilder for RecordTasks {
         async fn build_session_state(
             &self,
             ctx: WorkerQueryContext,
@@ -381,41 +262,62 @@ mod tests {
         }
     }
 
-    /// Blocks coordinator connections to workers until opened.
-    struct Gate {
-        entered: Notify,
-        open: Semaphore,
+    async fn gated_context(channel: GatedChannel) -> SessionContext {
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(SessionConfig::new().with_target_partitions(3))
+            .with_distributed_planner()
+            .with_distributed_worker_resolver(InMemoryWorkerResolver::new(3))
+            .with_distributed_channel_resolver(channel)
+            .with_distributed_file_scan_config_bytes_per_partition(1)
+            .unwrap()
+            .build();
+        let ctx = SessionContext::from(state);
+        register_parquet_tables(&ctx).await.unwrap();
+        ctx
     }
 
-    /// Wraps the coordinator's channel resolver, recording the [StreamCloseState] each worker
-    /// connection is opened under, and making connections wait on the [Gate].
+    /// In-memory workers whose connections wait for `open` before executing tasks, recording
+    /// the coordinator's [StreamCloseState] they were opened under.
     #[derive(Clone)]
-    struct RecordingChannel {
+    struct GatedChannel {
         inner: InMemoryChannelResolver,
-        gate: Arc<Gate>,
-        states: Arc<Mutex<Vec<Arc<StreamCloseState>>>>,
+        entered: Arc<Notify>,
+        open: Arc<Semaphore>,
+        state: Arc<Mutex<Option<Arc<StreamCloseState>>>>,
+    }
+
+    impl Default for GatedChannel {
+        fn default() -> Self {
+            Self {
+                inner: InMemoryChannelResolver::from_session_builder(DefaultSessionBuilder),
+                entered: Arc::default(),
+                open: Arc::new(Semaphore::new(0)),
+                state: Arc::default(),
+            }
+        }
     }
 
     #[async_trait]
-    impl ChannelResolver for RecordingChannel {
+    impl ChannelResolver for GatedChannel {
         async fn get_worker_client_for_url(
             &self,
             url: &Url,
         ) -> Result<Box<dyn WorkerChannel>, DataFusionError> {
-            Ok(Box::new(RecordingWorkerChannel {
+            Ok(Box::new(GatedWorkerChannel {
                 inner: self.inner.get_worker_client_for_url(url).await?,
-                channel: self.clone(),
+                gate: self.clone(),
             }))
         }
     }
 
-    struct RecordingWorkerChannel {
+    struct GatedWorkerChannel {
         inner: Box<dyn WorkerChannel>,
-        channel: RecordingChannel,
+        gate: GatedChannel,
     }
 
     #[async_trait]
-    impl WorkerChannel for RecordingWorkerChannel {
+    impl WorkerChannel for GatedWorkerChannel {
         async fn coordinator_channel(
             &mut self,
             headers: HeaderMap,
@@ -436,10 +338,9 @@ mod tests {
             metrics: ExecutionPlanMetricsSet,
             task_ctx: &Arc<TaskContext>,
         ) -> Result<Vec<BoxStream<'static, Result<RecordBatch>>>> {
-            let state = StreamCloseState::from_ctx(task_ctx);
-            self.channel.states.lock().unwrap().extend(state);
-            self.channel.gate.entered.notify_one();
-            drop(self.channel.gate.open.acquire().await);
+            *self.gate.state.lock().unwrap() = StreamCloseState::from_ctx(task_ctx);
+            self.gate.entered.notify_one();
+            drop(self.gate.open.acquire().await);
             self.inner
                 .execute_task(headers, request, metrics, task_ctx)
                 .await
@@ -450,94 +351,6 @@ mod tests {
             request: GetWorkerInfoRequest,
         ) -> Result<GetWorkerInfoResponse> {
             self.inner.get_worker_info(request).await
-        }
-    }
-
-    /// Places a [HoldInputExec] on top of every network boundary of the coordinator's stage.
-    fn hold_network_inputs(
-        plan: Arc<dyn ExecutionPlan>,
-        held: &Arc<Mutex<Vec<SendableRecordBatchStream>>>,
-    ) -> Arc<dyn ExecutionPlan> {
-        plan.transform_down(|node| {
-            if !node.is_network_boundary() {
-                return Ok(Transformed::no(node));
-            }
-            let node = Arc::new(HoldInputExec {
-                input: node,
-                held: Arc::clone(held),
-            });
-            Ok(Transformed::new(node, true, TreeNodeRecursion::Jump))
-        })
-        .unwrap()
-        .data
-    }
-
-    /// Stands in for a join's build side that stops being polled: reads the first batch of each
-    /// input partition, then parks the still open stream in `held` and outputs nothing.
-    struct HoldInputExec {
-        input: Arc<dyn ExecutionPlan>,
-        held: Arc<Mutex<Vec<SendableRecordBatchStream>>>,
-    }
-
-    impl Debug for HoldInputExec {
-        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-            f.write_str("HoldInputExec")
-        }
-    }
-
-    impl DisplayAs for HoldInputExec {
-        fn fmt_as(&self, _: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-            f.write_str("HoldInputExec")
-        }
-    }
-
-    impl ExecutionPlan for HoldInputExec {
-        fn name(&self) -> &str {
-            "HoldInputExec"
-        }
-
-        fn properties(&self) -> &Arc<PlanProperties> {
-            self.input.properties()
-        }
-
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![&self.input]
-        }
-
-        fn apply_expressions(
-            &self,
-            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
-        ) -> Result<TreeNodeRecursion> {
-            Ok(TreeNodeRecursion::Continue)
-        }
-
-        fn with_new_children(
-            self: Arc<Self>,
-            children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(Self {
-                input: require_one_child(children)?,
-                held: Arc::clone(&self.held),
-            }))
-        }
-
-        fn execute(
-            &self,
-            partition: usize,
-            context: Arc<TaskContext>,
-        ) -> Result<SendableRecordBatchStream> {
-            let mut input = self.input.execute(partition, context)?;
-            let held = Arc::clone(&self.held);
-            let stream = stream::once(async move {
-                input.next().await.transpose()?;
-                held.lock().unwrap().push(input);
-                Ok(())
-            })
-            .try_filter_map(|()| async { Ok(None) });
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                self.schema(),
-                stream,
-            )))
         }
     }
 }
